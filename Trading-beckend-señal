@@ -1,0 +1,91 @@
+import asyncio
+import os
+import json
+from typing import List
+import time
+import httpx
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from signals import generate_signal_from_closes
+
+TD_API_KEY = os.getenv("TD_API_KEY", "")
+SYMBOL = os.getenv("SYMBOL", "BTC/USD")
+INTERVAL = os.getenv("INTERVAL", "1min")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
+
+app = FastAPI(title="Trading Backend - Real Data")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_text(message)
+            except Exception:
+                self.disconnect(connection)
+
+manager = ConnectionManager()
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(poll_market_and_broadcast())
+
+@app.websocket("/ws/signals")
+async def websocket_signals(ws: WebSocket):
+    await manager.connect(ws)
+    try:
+        while True:
+            await asyncio.sleep(10)
+    except WebSocketDisconnect:
+        manager.disconnect(ws)
+
+async def poll_market_and_broadcast():
+    if not TD_API_KEY:
+        print("⚠️ No hay API key, generando datos simulados.")
+    http_timeout = httpx.Timeout(10.0)
+    client = httpx.AsyncClient(timeout=http_timeout)
+    candle_history = []
+    while True:
+        try:
+            if TD_API_KEY:
+                url = "https://api.twelvedata.com/time_series"
+                params = {"symbol": SYMBOL, "interval": INTERVAL, "outputsize": 200, "format": "JSON", "apikey": TD_API_KEY}
+                resp = await client.get(url, params=params)
+                data = resp.json()
+                values = list(reversed(data.get("values", [])))
+                closes = [float(v["close"]) for v in values]
+            else:
+                import random
+                if not candle_history:
+                    base = 100.0
+                    for _ in range(120):
+                        base += random.uniform(-1,1)
+                        candle_history.append(base)
+                else:
+                    base = candle_history[-1] + random.uniform(-1,1)
+                    candle_history.append(base)
+                closes = candle_history[-200:]
+            signal = generate_signal_from_closes(closes)
+            payload = {"symbol": SYMBOL, "price": closes[-1], "signal": signal}
+            await manager.broadcast(json.dumps(payload))
+        except Exception as e:
+            print("Error:", e)
+        await asyncio.sleep(POLL_SECONDS)
